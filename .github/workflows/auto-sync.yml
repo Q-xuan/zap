@@ -1,0 +1,193 @@
+# 自动同步上游 zerx-lab/zap → Q-xuan/zap,并在上游发新 tag 时触发 Windows build。
+#
+# 设计要点(对应你选的策略):
+#   - 频率:cron `0 */6 * * *`(每 6 小时检查一次)+ 手动 workflow_dispatch
+#   - 触发 build 的条件:仅当上游产生了「Q-xuan/zap 还没有的最新 tag」
+#     (只跟 tag,不跟 main commit;避免无意义的 nightly 包)
+#   - 自己的 commit(本文件、build-windows.yml 等)处理方式:rebase
+#     fetch upstream/main 后,把本地 main 上的自有 commit 重放到 upstream/main 之上,
+#     历史保持线性。冲突时 abort + 报错,不强制 push,等你手动处理。
+#
+# 为什么不用 GitHub 原生 fork sync:
+#   Q-xuan/zap 在 GitHub fork 网络里的 root source 是 warpdotdev/warp,
+#   merge-upstream API 与 UI「Sync fork」只能拉 warpdotdev/warp,拉不到
+#   你真正关心的直接 parent zerx-lab/zap。必须自建 sync。
+#
+# 为什么不用 PAT:
+#   GITHUB_TOKEN 足够(push main + push tags)。build 是同一 workflow 内的 job,
+#   不依赖 tag-push 事件触发(GITHUB_TOKEN 推 tag 不会触发 on.push.tags workflow),
+#   所以不需要 PAT 绕开递归保护。
+
+name: Auto Sync upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # UTC,每 6 小时一次
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 即使没新 tag 也强制跑一次 build(测试用)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write   # push main + push tags
+  actions: write    # 读 workflow run 状态(可选)
+
+env:
+  UPSTREAM_REPO: zerx-lab/zap
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: Sync upstream + detect new tag
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.check_tag.outputs.new_tag }}
+      synced: ${{ steps.rebase.outputs.synced }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # rebase + tag 比较需要完整历史
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # --tags 拿上游所有 tag;--prune 清掉上游已删的引用
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags --prune --no-recurse-submodules
+
+      # 关键:tag 比较必须在 push 之前,否则 origin 已经有新 tag 就分不出"新不新"了。
+      - name: Compare latest tag (before push)
+        id: check_tag
+        run: |
+          set -euo pipefail
+          # origin 上(= Q-xuan/zap 当前状态)reachable 自 main 的最新 tag
+          LOCAL_TAG=$(git tag --sort=-creatordate --merged "origin/${UPSTREAM_BRANCH}" | head -n1 || true)
+          # upstream 上 reachable 自 upstream/main 的最新 tag
+          UPSTREAM_TAG=$(git tag --sort=-creatordate --merged "upstream/${UPSTREAM_BRANCH}" | head -n1 || true)
+          {
+            echo "local_tag=${LOCAL_TAG}"
+            echo "upstream_tag=${UPSTREAM_TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::local tag   : ${LOCAL_TAG:-<none>}"
+          echo "::notice::upstream tag: ${UPSTREAM_TAG:-<none>}"
+
+          if [[ -n "${UPSTREAM_TAG}" && "${UPSTREAM_TAG}" != "${LOCAL_TAG}" ]]; then
+            echo "new_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+            echo "::notice::检测到上游新 tag ${UPSTREAM_TAG} → 同步后将触发 build"
+          else
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+            echo "::notice::无新 tag;仅同步 main(若需要)"
+          fi
+
+      # rebase 自己的 commit 到 upstream/main 之上。自己 commit 越少越不容易冲突。
+      - name: Rebase local main onto upstream/main
+        id: rebase
+        run: |
+          set -eu
+          git checkout "${UPSTREAM_BRANCH}"
+          BEFORE=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+
+          if [[ "$BEFORE" == "$UPSTREAM_HEAD" ]]; then
+            # 本地 main 已经 == upstream main(没有自己的 commit,或自己的 commit 已在上游)
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::local main 已与 upstream/main 一致,无需 rebase"
+            exit 0
+          fi
+
+          # 判断本地是否领先 upstream(自己的 commit 都已在上游基础上)
+          # → 直接快进即可,不需要 rebase
+          if git merge-base --is-ancestor "$UPSTREAM_HEAD" "$BEFORE"; then
+            # 本地领先或并行;尝试 rebase 让历史保持线性
+            :
+          fi
+
+          if git rebase "upstream/${UPSTREAM_BRANCH}"; then
+            AFTER=$(git rev-parse HEAD)
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::rebase 成功: ${BEFORE:0:9} → ${AFTER:0:9}"
+          else
+            git rebase --abort 2>/dev/null || true
+            echo "::error::rebase 冲突!请本地执行:'git fetch upstream && git rebase upstream/main' 手动解决后 push。"
+            exit 1
+          fi
+
+      # 同时满足两个条件之一才 push:rebase 改写了 main,或检测到新 tag(即使 main 没动也要补 tag)。
+      - name: Push main + tags
+        if: steps.rebase.outputs.synced == 'true' || steps.check_tag.outputs.new_tag != ''
+        run: |
+          set -euo pipefail
+          # rebase 改写历史,必须强推;--force-with-lease 防止覆盖别人(或自己别处)的 push
+          if [[ "${{ steps.rebase.outputs.synced }}" == "true" ]]; then
+            git push --force-with-lease origin "${UPSTREAM_BRANCH}"
+          fi
+          # 推送所有 upstream 有但 origin 没有的 tag(GitHub 自动忽略已存在的)
+          git push origin --tags
+
+  # build job:只在新 tag(或手动 force_build)时跑。
+  # 用 needs + outputs 把"检测到新 tag"这个事实在同一 workflow run 内传过来。
+  build:
+    name: Build Windows (new tag ${{ needs.sync.outputs.new_tag }})
+    needs: sync
+    if: needs.sync.outputs.new_tag != '' || github.event.inputs.force_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CHANNEL: oss
+      # script/bundle / build.rs 会读这个环境变量来决定版本号嵌入。手动 force_build 时
+      # 没有 new_tag,这里 fallback 到 main HEAD 的 short sha 做产物命名。
+      GIT_RELEASE_TAG: ${{ needs.sync.outputs.new_tag }}
+    steps:
+      - name: Pick ref to build
+        id: ref
+        shell: bash
+        run: |
+          if [[ -n "${{ needs.sync.outputs.new_tag }}" ]]; then
+            echo "ref=${{ needs.sync.outputs.new_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0   # build.rs / git-cliff 类工具可能需要
+
+      - name: Prepare environment
+        uses: ./.github/actions/prepare_environment
+        with:
+          target_os: windows
+          cache_key: x64
+          is_self_hosted: false
+
+      - name: Build binary (skip installer)
+        id: build_binary
+        run: script/bundle -Channel "$CHANNEL" -skip_build_installer --arch x64
+        shell: bash
+        env:
+          GIT_RELEASE_TAG: ${{ needs.sync.outputs.new_tag || github.sha }}
+
+      - name: Compute artifact name
+        id: name
+        shell: bash
+        run: |
+          SUFFIX="${{ needs.sync.outputs.new_tag }}"
+          if [[ -z "$SUFFIX" ]]; then SUFFIX="manual-$(echo ${{ github.sha }} | cut -c1-7)"; fi
+          echo "name=zap-windows-x64-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ${{ steps.build_binary.outputs.binary_path }}
+          if-no-files-found: error
+          retention-days: 30

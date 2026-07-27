@@ -1,0 +1,62 @@
+# 精简 Windows 编译 workflow(fork 友好,无 secret 依赖)
+#
+# 用途:在 fork 上手动产出 Windows x64 的 zap-oss.exe(workflow artifact),
+#       用于验证任意 commit 是否可编译,绕开本地 MSVC/SDK。
+#       不打 tag、不创建 GitHub Release、不跑三平台。
+#
+# 触发:Actions 页面手动 workflow_dispatch(可选 commit/branch/tag)。
+#       注意:自动「上游发新 tag → build」由 auto-sync.yml 负责,
+#       本 workflow 不监听 push,避免重复 build。
+#
+# 产物:zap-windows-x64 artifact(zap-oss.exe),约 20-40 分钟。
+#
+# 与 zap_release.yml 的关系:复用 ./.github/actions/prepare_environment(MSVC、
+# Strawberry Perl、protoc、cargo 依赖全在里面装好),只保留 release_windows job
+# 的 build binary 步骤,砍掉 installer、release、其它平台。
+
+name: Build Windows (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要 build 的 commit/branch/tag(留空 = 默认分支)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHANNEL: oss
+
+jobs:
+  build_windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+
+      - name: Prepare environment
+        uses: ./.github/actions/prepare_environment
+        with:
+          target_os: windows
+          cache_key: x64
+          is_self_hosted: false
+
+      - name: Build binary (skip installer)
+        id: build_binary
+        run: script/bundle -Channel $CHANNEL -skip_build_installer --arch x64
+        shell: bash
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-windows-x64
+          path: ${{ steps.build_binary.outputs.binary_path }}
+          if-no-files-found: error
+          retention-days: 14
