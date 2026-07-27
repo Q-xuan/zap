@@ -171,18 +171,74 @@ jobs:
         env:
           GIT_RELEASE_TAG: ${{ needs.sync.outputs.new_tag || github.sha }}
 
-      - name: Compute artifact name
+      - name: Compute artifact name + release metadata
         id: name
         shell: bash
         run: |
-          SUFFIX="${{ needs.sync.outputs.new_tag }}"
-          if [[ -z "$SUFFIX" ]]; then SUFFIX="manual-$(echo ${{ github.sha }} | cut -c1-7)"; fi
-          echo "name=zap-windows-x64-${SUFFIX}" >> "$GITHUB_OUTPUT"
+          NEW_TAG="${{ needs.sync.outputs.new_tag }}"
+          if [[ -n "$NEW_TAG" ]]; then
+            # 正式 release:对齐上游命名 "Zap v<tag>"
+            ARTIFACT_NAME="zap-windows-x64-${NEW_TAG}"
+            ASSET_NAME="zap-oss-${NEW_TAG}.exe"
+            RELEASE_NAME="Zap ${NEW_TAG}"
+            RELEASE_BODY="Windows x64 build of ${NEW_TAG} (synced from upstream ${UPSTREAM_REPO})."
+            PRERELEASE="false"
+          else
+            # 手动 force_build:挂到 prerelease,避免污染正式 release
+            SHORT_SHA="$(echo ${{ github.sha }} | cut -c1-7)"
+            ARTIFACT_NAME="zap-windows-x64-manual-${SHORT_SHA}"
+            ASSET_NAME="zap-oss-main-${SHORT_SHA}.exe"
+            RELEASE_NAME="Zap nightly (${SHORT_SHA})"
+            RELEASE_BODY="Manual force_build from main @ ${SHORT_SHA}. Not an official release."
+            PRERELEASE="true"
+          fi
+          {
+            echo "artifact_name=${ARTIFACT_NAME}"
+            echo "asset_name=${ASSET_NAME}"
+            echo "release_name=${RELEASE_NAME}"
+            printf 'release_body<<EOF\n%s\nEOF\n' "$RELEASE_BODY"
+            echo "prerelease=${PRERELEASE}"
+            # tag:有新 tag 用之;force_build 用日期化的临时 tag 避免与上游冲突
+            if [[ -n "$NEW_TAG" ]]; then
+              echo "release_tag=${NEW_TAG}"
+            else
+              echo "release_tag=nightly-${SHORT_SHA}"
+            fi
+          } >> "$GITHUB_OUTPUT"
 
+      # 同时留一份 workflow artifact(防止 release 步骤失败时丢产物,也方便直接下载)
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.name.outputs.name }}
+          name: ${{ steps.name.outputs.artifact_name }}
           path: ${{ steps.build_binary.outputs.binary_path }}
           if-no-files-found: error
           retention-days: 30
+
+      # 重命名为最终 asset 文件名,上传到 release 用
+      - name: Stage binary for release upload
+        id: stage
+        shell: bash
+        run: |
+          SRC="${{ steps.build_binary.outputs.binary_path }}"
+          DST="${{ runner.temp }}/${{ steps.name.outputs.asset_name }}"
+          cp "$SRC" "$DST"
+          echo "path=$DST" >> "$GITHUB_OUTPUT"
+          ls -la "$DST"
+
+      # softprops/action-gh-release 幂等:release 不存在则创建,存在则只补 asset。
+      # tag_exists 时它会复用,不会重写 body/tag_name。files 支持多文件。
+      - name: Create/update GitHub Release + upload .exe
+        uses: softprops/action-gh-release@c062e08bd532815e2082a07b400bb5d2d2856836 # v2.3.3
+        with:
+          tag_name: ${{ steps.name.outputs.release_tag }}
+          name: ${{ steps.name.outputs.release_name }}
+          body: ${{ steps.name.outputs.release_body }}
+          prerelease: ${{ steps.name.outputs.prerelease }}
+          files: ${{ steps.stage.outputs.path }}
+          target_commitish: ${{ github.event.repository.default_branch }}
+          # fork 上不抢 "latest" 标记(避免影响 fork 网络的 metadata)。
+          # 用户从 Releases 页面手动选要看哪个即可。
+          make_latest: 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
