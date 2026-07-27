@@ -1,28 +1,22 @@
 # 自动同步上游 zerx-lab/zap → Q-xuan/zap,并在上游发新 tag 时触发 Windows build。
 #
-# 设计要点(对应你选的策略):
-#   - 频率:cron `0 */6 * * *`(每 6 小时检查一次)+ 手动 workflow_dispatch
-#   - 触发 build 的条件:仅当上游产生了「Q-xuan/zap 还没有的最新 tag」
-#     (只跟 tag,不跟 main commit;避免无意义的 nightly 包)
-#   - 自己的 commit(本文件、build-windows.yml 等)处理方式:rebase
-#     fetch upstream/main 后,把本地 main 上的自有 commit 重放到 upstream/main 之上,
-#     历史保持线性。冲突时 abort + 报错,不强制 push,等你手动处理。
+# 设计要点:
+#   - 频率:cron `0 */6 * * *`(每 6 小时)+ 手动 workflow_dispatch
+#   - build 触发条件:仅当上游有 Q-xuan/zap 还没有的最新 tag
+#   - 自己的 commit 处理:rebase 到 upstream/main 之上,历史线性
 #
-# 为什么不用 GitHub 原生 fork sync:
-#   Q-xuan/zap 在 GitHub fork 网络里的 root source 是 warpdotdev/warp,
-#   merge-upstream API 与 UI「Sync fork」只能拉 warpdotdev/warp,拉不到
-#   你真正关心的直接 parent zerx-lab/zap。必须自建 sync。
-#
-# 为什么不用 PAT:
-#   GITHUB_TOKEN 足够(push main + push tags)。build 是同一 workflow 内的 job,
-#   不依赖 tag-push 事件触发(GITHUB_TOKEN 推 tag 不会触发 on.push.tags workflow),
-#   所以不需要 PAT 绕开递归保护。
+# v2 关键修复:
+#   - tag 比较改用 `git ls-remote --tags origin`(查远程真实状态),不用本地
+#     `git tag`(被 checkout 的 fetch-depth:0 污染,会拿到 upstream 的 tag);
+#   - push 拆成「只在 main 变了才 force-with-lease push」+「只推具体的新 tag」,
+#     不再用 `git push --tags` 全量推,避免 upstream 中指向非 main commit 的 tag
+#     push 失败拖垮整步。
 
 name: Auto Sync upstream
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # UTC,每 6 小时一次
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       force_build:
@@ -32,8 +26,8 @@ on:
         default: false
 
 permissions:
-  contents: write   # push main + push tags
-  actions: write    # 读 workflow run 状态(可选)
+  contents: write
+  actions: write
 
 env:
   UPSTREAM_REPO: zerx-lab/zap
@@ -45,11 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       new_tag: ${{ steps.check_tag.outputs.new_tag }}
-      synced: ${{ steps.rebase.outputs.synced }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # rebase + tag 比较需要完整历史
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
@@ -60,82 +53,87 @@ jobs:
       - name: Add upstream remote and fetch
         run: |
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          # --tags 拿上游所有 tag;--prune 清掉上游已删的引用
           git fetch upstream "${UPSTREAM_BRANCH}" --tags --prune --no-recurse-submodules
 
-      # 关键:tag 比较必须在 push 之前,否则 origin 已经有新 tag 就分不出"新不新"了。
-      - name: Compare latest tag (before push)
+      # 关键:用 ls-remote 查 origin 远程真实的 tag 集合,
+      # 不能用本地 `git tag`(checkout 的 fetch-depth:0 已把 upstream tag 拉到本地)。
+      - name: Detect new upstream tag
         id: check_tag
         run: |
-          set -euo pipefail
-          # origin 上(= Q-xuan/zap 当前状态)reachable 自 main 的最新 tag
-          LOCAL_TAG=$(git tag --sort=-creatordate --merged "origin/${UPSTREAM_BRANCH}" | head -n1 || true)
-          # upstream 上 reachable 自 upstream/main 的最新 tag
-          UPSTREAM_TAG=$(git tag --sort=-creatordate --merged "upstream/${UPSTREAM_BRANCH}" | head -n1 || true)
-          {
-            echo "local_tag=${LOCAL_TAG}"
-            echo "upstream_tag=${UPSTREAM_TAG}"
-          } >> "$GITHUB_OUTPUT"
-          echo "::notice::local tag   : ${LOCAL_TAG:-<none>}"
-          echo "::notice::upstream tag: ${UPSTREAM_TAG:-<none>}"
+          set -uo pipefail
+          ORIGIN_TAGS=$(git ls-remote --tags --refs origin \
+                        | awk -F'\t' '{print $2}' \
+                        | sed 's|^refs/tags/||' \
+                        | sort -u)
+          echo "::notice::origin 上 tag 数: $(echo "$ORIGIN_TAGS" | grep -c . || true)"
 
-          if [[ -n "${UPSTREAM_TAG}" && "${UPSTREAM_TAG}" != "${LOCAL_TAG}" ]]; then
-            echo "new_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
-            echo "::notice::检测到上游新 tag ${UPSTREAM_TAG} → 同步后将触发 build"
+          UPSTREAM_TAG=$(git tag --sort=-creatordate \
+                        --merged "upstream/${UPSTREAM_BRANCH}" \
+                        | head -n1 || true)
+          echo "::notice::upstream 最新 tag: ${UPSTREAM_TAG:-<none>}"
+
+          NEW_TAG=""
+          if [[ -n "${UPSTREAM_TAG}" ]] && ! grep -qxF "${UPSTREAM_TAG}" <<<"${ORIGIN_TAGS}"; then
+            NEW_TAG="${UPSTREAM_TAG}"
+            echo "::notice::检测到上游新 tag ${NEW_TAG} → 将同步 + 触发 build"
           else
-            echo "new_tag=" >> "$GITHUB_OUTPUT"
-            echo "::notice::无新 tag;仅同步 main(若需要)"
+            echo "::notice::无新 tag(origin 已有 ${UPSTREAM_TAG:-<none>})"
           fi
+          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
 
-      # rebase 自己的 commit 到 upstream/main 之上。自己 commit 越少越不容易冲突。
       - name: Rebase local main onto upstream/main
         id: rebase
         run: |
-          set -eu
+          set -uo pipefail
           git checkout "${UPSTREAM_BRANCH}"
           BEFORE=$(git rev-parse HEAD)
           UPSTREAM_HEAD=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          ORIGIN_HEAD=$(git rev-parse "origin/${UPSTREAM_BRANCH}")
+          echo "::notice::before(local main)=${BEFORE:0:9}  upstream/main=${UPSTREAM_HEAD:0:9}  origin/main=${ORIGIN_HEAD:0:9}"
 
-          if [[ "$BEFORE" == "$UPSTREAM_HEAD" ]]; then
-            # 本地 main 已经 == upstream main(没有自己的 commit,或自己的 commit 已在上游)
-            echo "synced=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::local main 已与 upstream/main 一致,无需 rebase"
+          if [[ "$BEFORE" == "$UPSTREAM_HEAD" && "$BEFORE" == "$ORIGIN_HEAD" ]]; then
+            echo "::notice::三者一致,无需 rebase/push"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 判断本地是否领先 upstream(自己的 commit 都已在上游基础上)
-          # → 直接快进即可,不需要 rebase
-          if git merge-base --is-ancestor "$UPSTREAM_HEAD" "$BEFORE"; then
-            # 本地领先或并行;尝试 rebase 让历史保持线性
-            :
+          CHANGED="false"
+          if [[ "$BEFORE" != "$UPSTREAM_HEAD" ]]; then
+            if git rebase "upstream/${UPSTREAM_BRANCH}"; then
+              echo "::notice::rebase 成功: ${BEFORE:0:9} → $(git rev-parse HEAD | cut -c1-9)"
+              CHANGED="true"
+            else
+              git rebase --abort 2>/dev/null || true
+              echo "::error::rebase 冲突!请本地执行 'git fetch upstream && git rebase upstream/main' 手动解决后 push。"
+              exit 1
+            fi
           fi
+          echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
 
-          if git rebase "upstream/${UPSTREAM_BRANCH}"; then
-            AFTER=$(git rev-parse HEAD)
-            echo "synced=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::rebase 成功: ${BEFORE:0:9} → ${AFTER:0:9}"
-          else
-            git rebase --abort 2>/dev/null || true
-            echo "::error::rebase 冲突!请本地执行:'git fetch upstream && git rebase upstream/main' 手动解决后 push。"
-            exit 1
-          fi
-
-      # 同时满足两个条件之一才 push:rebase 改写了 main,或检测到新 tag(即使 main 没动也要补 tag)。
-      - name: Push main + tags
-        if: steps.rebase.outputs.synced == 'true' || steps.check_tag.outputs.new_tag != ''
+      # 只在 main 真的变(rebase 改写)时 push。
+      - name: Push main (only if rebased)
+        if: steps.rebase.outputs.changed == 'true'
         run: |
-          set -euo pipefail
-          # rebase 改写历史,必须强推;--force-with-lease 防止覆盖别人(或自己别处)的 push
-          if [[ "${{ steps.rebase.outputs.synced }}" == "true" ]]; then
-            git push --force-with-lease origin "${UPSTREAM_BRANCH}"
+          set -uo pipefail
+          if [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/${UPSTREAM_BRANCH})" ]]; then
+            echo "::notice::rebase 后 local main == origin/main,跳过 push"
+            exit 0
           fi
-          # 推送所有 upstream 有但 origin 没有的 tag(GitHub 自动忽略已存在的)
-          git push origin --tags
+          git push --force-with-lease="refs/remotes/origin/${UPSTREAM_BRANCH}" origin "${UPSTREAM_BRANCH}"
+          echo "::notice::main 已 force-with-lease push"
 
-  # build job:只在新 tag(或手动 force_build)时跑。
-  # 用 needs + outputs 把"检测到新 tag"这个事实在同一 workflow run 内传过来。
+      # 只推具体的新 tag,不再用 --tags 全量推。
+      - name: Push new tag (only if any)
+        if: steps.check_tag.outputs.new_tag != ''
+        run: |
+          set -uo pipefail
+          NEW_TAG="${{ steps.check_tag.outputs.new_tag }}"
+          echo "推送新 tag: ${NEW_TAG}"
+          git push origin "refs/tags/${NEW_TAG}:refs/tags/${NEW_TAG}"
+          echo "::notice::tag ${NEW_TAG} 已推送"
+
   build:
-    name: Build Windows (new tag ${{ needs.sync.outputs.new_tag }})
+    name: Build Windows (${{ needs.sync.outputs.new_tag || 'force' }})
     needs: sync
     if: needs.sync.outputs.new_tag != '' || github.event.inputs.force_build == 'true'
     runs-on: windows-latest
@@ -143,9 +141,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CHANNEL: oss
-      # script/bundle / build.rs 会读这个环境变量来决定版本号嵌入。手动 force_build 时
-      # 没有 new_tag,这里 fallback 到 main HEAD 的 short sha 做产物命名。
-      GIT_RELEASE_TAG: ${{ needs.sync.outputs.new_tag }}
     steps:
       - name: Pick ref to build
         id: ref
@@ -160,7 +155,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.ref.outputs.ref }}
-          fetch-depth: 0   # build.rs / git-cliff 类工具可能需要
+          fetch-depth: 0
 
       - name: Prepare environment
         uses: ./.github/actions/prepare_environment
