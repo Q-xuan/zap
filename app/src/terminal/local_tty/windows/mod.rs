@@ -274,7 +274,8 @@ fn shell_command(shell_starter: &DirectShellStarter) -> Result<HSTRING, Encoding
     }
     let hstring = HSTRING::from_wide(&encoded_shell_command);
     // DEBUG: 把完整命令行 dump 到文件,诊断 PS 7.6 崩溃
-    if let Ok(cmd_str) = hstring.to_string() {
+    {
+        let cmd_str = hstring.to_string();
         let log_path = std::env::temp_dir().join("zap_shell_command.log");
         let mut dump = String::new();
         dump.push_str(&format!("zap shell command line (len={}):\n{}\n\n--- args ---\n", cmd_str.len(), cmd_str));
