@@ -665,7 +665,6 @@ fn arguments_for_session_spawning_command(
             let init_script = init_shell_script_for_shell(ShellType::PowerShell, &crate::ASSETS);
             let utf16le: Vec<u8> = init_script
                 .encode_utf16()
-                .chain(std::iter::once(0))
                 .flat_map(|w| w.to_le_bytes())
                 .collect();
             use base64::Engine as _;

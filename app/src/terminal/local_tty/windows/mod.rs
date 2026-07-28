@@ -272,22 +272,7 @@ fn shell_command(shell_starter: &DirectShellStarter) -> Result<HSTRING, Encoding
         }
         append_quoted(arg, &mut encoded_shell_command);
     }
-    let hstring = HSTRING::from_wide(&encoded_shell_command);
-    // DEBUG: 把完整命令行 dump 到文件,诊断 PS 7.6 崩溃
-    {
-        let cmd_str = hstring.to_string();
-        let log_path = std::env::temp_dir().join("zap_shell_command.log");
-        let mut dump = String::new();
-        dump.push_str(&format!("zap shell command line (len={}):\n{}\n\n--- args ---\n", cmd_str.len(), cmd_str));
-        for (i, arg) in shell_starter.args().iter().enumerate() {
-            let arg_str = arg.to_string_lossy();
-            let preview: &str = if arg_str.len() > 100 { &arg_str[..100] } else { &arg_str };
-            dump.push_str(&format!("[{}] len={} {}\n", i, arg_str.len(), preview));
-        }
-        let _ = std::fs::write(&log_path, dump);
-        log::info!("DEBUG: shell command logged to {:?}", log_path);
-    }
-    Ok(hstring)
+    Ok(HSTRING::from_wide(&encoded_shell_command))
 }
 
 /// Appends an argument and properly quotes it.
