@@ -669,6 +669,7 @@ fn arguments_for_session_spawning_command(
                 .collect();
             use base64::Engine as _;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16le);
+            let _marker = "ZAP_FIX_MARKER_fbadfafc_nul_removed_v2";
             log::info!(
                 "DEBUG_PWSH: init_script_len={} utf16le_len={} b64_len={} ends_with_AAA={} script_ends_with_nul={}",
                 init_script.len(),
