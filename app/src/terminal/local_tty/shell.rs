@@ -662,21 +662,27 @@ fn arguments_for_session_spawning_command(
             // the Windows argv splitter and the PS tokenizer alike. This sidesteps
             // the quoting bug entirely on every PS version, at the cost of a
             // ~3-4x larger argv (still well under CreateProcess's 32k limit).
-            let init_script = init_shell_script_for_shell(ShellType::PowerShell, &crate::ASSETS);
+            let mut init_script = init_shell_script_for_shell(ShellType::PowerShell, &crate::ASSETS);
+            // PS 7.6 treats a trailing NUL (U+0000) in the -EncodedCommand
+            // payload as script content and errors out at runtime.  The init
+            // script itself never contains a NUL, but we strip defensively in
+            // case an upstream layer (asset embedding, OsString round-trip)
+            // appends one.
+            while init_script.ends_with('\0') {
+                init_script.pop();
+            }
             let utf16le: Vec<u8> = init_script
                 .encode_utf16()
                 .flat_map(|w| w.to_le_bytes())
                 .collect();
             use base64::Engine as _;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16le);
-            let _marker = "ZAP_FIX_MARKER_fbadfafc_nul_removed_v2";
             log::info!(
-                "DEBUG_PWSH: init_script_len={} utf16le_len={} b64_len={} ends_with_AAA={} script_ends_with_nul={}",
+                "DEBUG_PWSH: init_script_len={} utf16le_len={} b64_len={} ends_with_AAA={}",
                 init_script.len(),
                 utf16le.len(),
                 encoded.len(),
                 encoded.ends_with("AAA="),
-                init_script.ends_with('\0'),
             );
             args.push("-EncodedCommand".to_owned().into());
             args.push(encoded.into());
