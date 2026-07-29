@@ -1,8 +1,5 @@
-﻿# Prevent history from being written to file, among other interactive features.
+# Prevent history from being written to file, among other interactive features.
 Remove-Module -Name PSReadline -ErrorAction Ignore
-$diagLog = "$env:TEMP\zap_init_diag.log"
-try {
-    Add-Content -Path $diagLog -Value "[$(Get-Date -Format 'HH:mm:ss.fff')] START ps=$($PSVersionTable.PSVersion) edition=$PSEdition interactive=$([Environment]::UserInteractive) host=$($host.Name) pid=$PID"
 
 $global:_warpOriginalPrompt = $function:global:prompt
 
@@ -23,7 +20,6 @@ if ($PSEdition -eq 'Desktop' -or $IsWindows) {
 function prompt {
     # Reset the prompt back to the default to avoid infinite loops if sourcing the bootstrap script has an error.
     $function:global:prompt = $global:_warpOriginalPrompt
-    Add-Content -Path $diagLog -Value "[$(Get-Date -Format 'HH:mm:ss.fff')] PROMPT CALLED"
     $username = [Environment]::UserName
     $epoch = [int](New-TimeSpan -Start ([DateTime]::new(1970, 1, 1, 0, 0, 0, 0)) -End ([DateTime]::UtcNow)).TotalSeconds
     $random = Get-Random -Maximum 32768
@@ -36,10 +32,4 @@ function prompt {
     $oscParameterSeparator = ';'
     Write-Host "${oscStart}${oscJsonMarker}${oscParameterSeparator}${encodedMsg}${oscEnd}"
     return $null
-}
-    Add-Content -Path $diagLog -Value "[$(Get-Date -Format 'HH:mm:ss.fff')] SCRIPT OK (prompt defined)"
-} catch {
-    Add-Content -Path $diagLog -Value "[$(Get-Date -Format 'HH:mm:ss.fff')] ERROR: $($_.Exception.Message)"
-    Add-Content -Path $diagLog -Value "[$(Get-Date -Format 'HH:mm:ss.fff')] TRACE: $($_.ScriptStackTrace)"
-    throw
 }

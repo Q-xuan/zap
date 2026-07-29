@@ -652,40 +652,24 @@ fn arguments_for_session_spawning_command(
             // command-line quoting (backslash-escaping `"` → `\"`, see
             // `append_quoted` in windows/mod.rs) is correct for cmd.exe-style
             // argument parsing, but PowerShell's `-Command` parser does NOT
-            // honour `\"` — on PS 7.6 the stray `\" tokens trip the parser
+            // honour `\"` — on PS 7.6 the stray `\"` tokens trip the parser
             // (e.g. `[int64]"$epoch$random"` becomes `[int64]\"$epoch$random\"`
             // → ParserError: Unexpected token), the whole init script fails to
             // parse, pwsh exits with code 0 before emitting the InitShell OSC,
             // and zap shows "Shell process exited prematurely".
             //
-            // `-EncodedCommand` takes a UTF-16LE base64 blob, which is opaque to
-            // the Windows argv splitter and the PS tokenizer alike. This sidesteps
-            // the quoting bug entirely on every PS version, at the cost of a
-            // ~3-4x larger argv (still well under CreateProcess's 32k limit).
-            let mut init_script = init_shell_script_for_shell(ShellType::PowerShell, &crate::ASSETS);
-            // PS 7.6 treats a trailing NUL (U+0000) in the -EncodedCommand
-            // payload as script content and errors out at runtime.  The init
-            // script itself never contains a NUL, but we strip defensively in
-            // case an upstream layer (asset embedding, OsString round-trip)
-            // appends one.
-            while init_script.ends_with('\0') {
-                init_script.pop();
+            // We write the init script to a temp .ps1 file and use `-File` to
+            // sidestep the quoting bug. Unlike `-Command`, `-File` passes the
+            // path through argv quoting (no quotes-in-script issue), and
+            // unlike `-EncodedCommand`, the file path is stable and short.
+            let init_script = init_shell_script_for_shell(ShellType::PowerShell, &crate::ASSETS);
+            let init_file = std::env::temp_dir().join(format!("zap_pwsh_init_{}.ps1", std::process::id()));
+            if let Err(e) = std::fs::write(&init_file, &init_script) {
+                log::warn!("Failed to write init script to {:?}: {e}", init_file);
             }
-            let utf16le: Vec<u8> = init_script
-                .encode_utf16()
-                .flat_map(|w| w.to_le_bytes())
-                .collect();
-            use base64::Engine as _;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16le);
-            log::info!(
-                "DEBUG_PWSH: init_script_len={} utf16le_len={} b64_len={} ends_with_AAA={}",
-                init_script.len(),
-                utf16le.len(),
-                encoded.len(),
-                encoded.ends_with("AAA="),
-            );
-            args.push("-EncodedCommand".to_owned().into());
-            args.push(encoded.into());
+            log::info!("DEBUG_PWSH: init_script_len={} file={:?}", init_script.len(), init_file);
+            args.push("-File".to_owned().into());
+            args.push(init_file.as_os_str().to_owned());
             args
         }
     }
