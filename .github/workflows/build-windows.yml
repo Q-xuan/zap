@@ -1,0 +1,61 @@
+# 精简 Windows 编译 workflow(fork 友好,无 secret 依赖)
+name: Build Windows (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: commit/branch/tag
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHANNEL: oss
+
+jobs:
+  build_windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+
+      - name: Prepare environment
+        uses: ./.github/actions/prepare_environment
+        with:
+          target_os: windows
+          cache_key: x64
+          is_self_hosted: false
+
+      - name: Build binary (skip installer)
+        id: build_binary
+        run: script/bundle -Channel $CHANNEL -skip_build_installer --arch x64
+        shell: bash
+
+      - name: Package binary with ConPTY DLLs
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.build_binary.outputs.binary_path }}"
+          $dir = Split-Path $exe -Parent
+          $staging = "$env:RUNNER_TEMP\zap-staging"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item "$dir\zap-oss.exe" $staging
+          Copy-Item "$dir\conpty.dll" $staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "$staging\x64" -Force | Out-Null
+          Copy-Item "$dir\x64\OpenConsole.exe" "$staging\x64" -ErrorAction SilentlyContinue
+          Write-Host "Staged files:"
+          Get-ChildItem $staging -Recurse | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-windows-x64
+          path: ${{ runner.temp }}/zap-staging
+          if-no-files-found: error
+          retention-days: 14
