@@ -42,15 +42,16 @@ jobs:
         shell: pwsh
         run: |
           $exe = "${{ steps.build_binary.outputs.binary_path }}"
-          $dir = Split-Path $exe -Parent
           $staging = "$env:RUNNER_TEMP\zap-staging"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          Copy-Item "$dir\zap-oss.exe" $staging
-          Copy-Item "$dir\conpty.dll" $staging -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path "$staging\x64" -Force | Out-Null
-          Copy-Item "$dir\x64\OpenConsole.exe" "$staging\x64" -ErrorAction SilentlyContinue
+          # exe from build output
+          Copy-Item $exe "$staging\zap-oss.exe"
+          # conpty.dll + OpenConsole.exe from repo assets (build.rs may not copy them)
+          Copy-Item "app\assets\windows\x64\conpty.dll" "$staging\conpty.dll" -Force
+          Copy-Item "app\assets\windows\x64\OpenConsole.exe" "$staging\x64\OpenConsole.exe" -Force
           Write-Host "Staged files:"
-          Get-ChildItem $staging -Recurse | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
+          Get-ChildItem $staging -Recurse | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
